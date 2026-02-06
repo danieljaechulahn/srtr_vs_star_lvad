@@ -1,0 +1,2390 @@
+---
+title: "Untitled"
+output: html_document
+date: "2026-01-28"
+---
+
+
+
+``` {r lvad srtr}
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(patchwork)
+library(scales)
+
+# ============================================================================
+# GET SRTR LVAD TIMELINE FROM DEVICE FILE WITH EXPLANT LOGIC
+# ============================================================================
+
+lvad_keywords <- c("heartmate", "hm", "lionheart", "arrow", "jarvik", "micromed", 
+                   "debakey", "novacor", "evaheart", "worldheart", "levacor", 
+                   "reliantheart", "hvad", "heartsaver")
+
+# Get all LVAD implants from thor_support_device
+srtr_lvad_implants <- thor_support_device %>%
+  filter(VadBrandId %in% c('202', '205', '206', '207', '208', '209', '210', '212', 
+                           '213', '214', '223', '224', '233', '236', '239', '240', 
+                           '312', '313', '314', '315', '316', '319', '322', '327', 
+                           '330', '333', '334') | 
+           (VadBrandId == 999 & grepl(paste(lvad_keywords, collapse = "|"), 
+                                      OtherSpecify, ignore.case = TRUE))) %>%
+  group_by(PX_ID) %>%
+  arrange(ImplantDt) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(PX_ID, lvad_implant_date = ImplantDt)
+
+cat("Total SRTR patients with LVAD from device file:", nrow(srtr_lvad_implants), "\n")
+
+# Get status history to identify explants (Status 5/6 with no return to Status 1-4)
+status_history <- stathist_thor2025q2 %>%
+  select(PX_ID, CANHX_BEGIN_DT, CANHX_END_DT, CANHX_STAT_CD) %>%
+  mutate(
+    status_numeric = case_when(
+      CANHX_STAT_CD %in% c(1110, 2110) ~ 1,
+      CANHX_STAT_CD %in% c(1120, 2120) ~ 2,
+      CANHX_STAT_CD %in% c(1130, 2130) ~ 3,
+      CANHX_STAT_CD %in% c(1140, 2140) ~ 4,
+      CANHX_STAT_CD %in% c(1150, 2150) ~ 5,
+      CANHX_STAT_CD %in% c(1160, 2160) ~ 6,
+      TRUE ~ 99
+    )
+  ) %>%
+  inner_join(srtr_lvad_implants, by = "PX_ID") %>%
+  filter(CANHX_BEGIN_DT >= lvad_implant_date) %>%  # Only status periods after LVAD
+  arrange(PX_ID, CANHX_BEGIN_DT)
+
+# Identify presumed explants: Status 5/6 with no return to Status 1-4
+first_status56 <- status_history %>%
+  filter(status_numeric %in% c(5, 6)) %>%
+  group_by(PX_ID) %>%
+  arrange(CANHX_BEGIN_DT) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(PX_ID, first_56_date = CANHX_BEGIN_DT)
+
+returned_to_active <- status_history %>%
+  inner_join(first_status56, by = "PX_ID") %>%
+  filter(status_numeric %in% c(1, 2, 3, 4) & CANHX_BEGIN_DT > first_56_date) %>%
+  distinct(PX_ID)
+
+presumed_explants_device <- first_status56 %>%
+  filter(!PX_ID %in% returned_to_active$PX_ID) %>%
+  select(PX_ID, explant_dt = first_56_date)
+
+cat("Patients with presumed explant (Status 5/6, no return):", nrow(presumed_explants_device), "\n")
+
+# Merge implant and explant dates
+srtr_lvad_timeline <- srtr_lvad_implants %>%
+  left_join(presumed_explants_device, by = "PX_ID")
+
+# ============================================================================
+# PREVALENCE ANALYSIS WITH EXPLANT CENSORING
+# ============================================================================
+
+dates_to_check <- c(
+  mdy("10-18-2018"),
+  seq(mdy("01-01-2019"), mdy("07-01-2025"), by = "2 months") - days(1)
+)
+
+get_srtr_lvad_prevalence <- function(check_date) {
+  
+  cat("Processing SRTR date:", format(check_date, "%Y-%m-%d"), "\n")
+  
+  candidates_on_date <- cand_thor2025q2 %>%
+    filter(CAN_LISTING_DT <= check_date) %>%
+    filter(is.na(CAN_REM_DT) | CAN_REM_DT > check_date) %>%
+    filter(CAN_AGE_IN_MONTHS_AT_LISTING / 12 > 17) %>%
+    select(PX_ID, CAN_LISTING_DT, CAN_REM_DT)
+  
+  candidates_with_lvad <- candidates_on_date %>%
+    left_join(srtr_lvad_timeline, by = "PX_ID") %>%
+    mutate(
+      has_lvad = !is.na(lvad_implant_date) & 
+        lvad_implant_date <= check_date &
+        (is.na(explant_dt) | explant_dt > check_date)
+    )
+  
+  total_waitlist <- nrow(candidates_on_date)
+  total_with_lvad <- sum(candidates_with_lvad$has_lvad, na.rm = TRUE)
+  
+  return(data.frame(
+    date = check_date,
+    total_waitlist = total_waitlist,
+    total_with_lvad = total_with_lvad
+  ))
+}
+
+prevalence_results_list <- lapply(dates_to_check, get_srtr_lvad_prevalence)
+prevalence_results_df <- bind_rows(prevalence_results_list)
+
+prevalence_results_df <- prevalence_results_df %>%
+  mutate(
+    lvad_proportion = total_with_lvad / total_waitlist * 100,
+    date_label = format(date, "%b %d, %Y"),
+    date_factor = factor(date_label, levels = date_label)
+  )
+
+prevalence_results_df %>%
+  select(date_label, total_waitlist, total_with_lvad, lvad_proportion) %>%
+  mutate(lvad_proportion = round(lvad_proportion, 2)) %>%
+  kable(format = "simple", 
+        col.names = c("Date", "Total Waitlist", "Total with LVAD", "LVAD %"),
+        align = c('l', 'r', 'r', 'r'))
+
+# ============================================================================
+# FLOW/INCIDENCE ANALYSIS
+# ============================================================================
+
+period_starts <- seq(mdy("01-01-2019"), mdy("06-01-2025"), by = "2 months")
+period_ends <- period_starts %m+% months(2) - days(1)
+
+get_srtr_lvad_flow <- function(start_date, end_date) {
+  
+  cat("Processing SRTR period:", format(start_date, "%Y-%m-%d"), "to", format(end_date, "%Y-%m-%d"), "\n")
+  
+  # Get all candidates on waitlist during this period
+  candidates_in_period <- cand_thor2025q2 %>%
+    filter(CAN_LISTING_DT <= end_date) %>%
+    filter(is.na(CAN_REM_DT) | CAN_REM_DT >= start_date) %>%
+    filter(CAN_AGE_IN_MONTHS_AT_LISTING / 12 > 17) %>%
+    select(PX_ID, CAN_LISTING_DT, CAN_REM_DT)
+  
+  # Join with LVAD timeline
+  candidates_with_lvad <- candidates_in_period %>%
+    left_join(srtr_lvad_timeline, by = "PX_ID")
+  
+  # 1. NEW LISTINGS WITH LVAD (listed during period, already had LVAD at listing)
+  new_listings_with_lvad <- candidates_with_lvad %>%
+    filter(CAN_LISTING_DT >= start_date & CAN_LISTING_DT <= end_date) %>%
+    filter(!is.na(lvad_implant_date) & lvad_implant_date <= CAN_LISTING_DT) %>%
+    nrow()
+  
+  # 2. LVAD IMPLANTS WHILE ON WAITLIST (got first LVAD during period, already on waitlist)
+  lvad_implants_on_waitlist <- candidates_with_lvad %>%
+    filter(!is.na(lvad_implant_date)) %>%
+    filter(lvad_implant_date >= start_date & lvad_implant_date <= end_date) %>%
+    filter(lvad_implant_date > CAN_LISTING_DT) %>%
+    nrow()
+  
+  # 3. LVAD EXPLANTS DURING PERIOD
+  lvad_explants <- candidates_with_lvad %>%
+    filter(!is.na(explant_dt)) %>%
+    filter(explant_dt >= start_date & explant_dt <= end_date) %>%
+    nrow()
+  
+  # Total new listings
+  total_new_listings <- candidates_with_lvad %>%
+    filter(CAN_LISTING_DT >= start_date & CAN_LISTING_DT <= end_date) %>%
+    nrow()
+  
+  return(data.frame(
+    period_start = start_date,
+    period_end = end_date,
+    new_listings_with_lvad = new_listings_with_lvad,
+    lvad_implants_on_waitlist = lvad_implants_on_waitlist,
+    lvad_explants = lvad_explants,
+    total_new_listings = total_new_listings
+  ))
+}
+
+# Run flow analysis
+flow_results_list <- list()
+for (i in 1:length(period_starts)) {
+  flow_results_list[[i]] <- get_srtr_lvad_flow(period_starts[i], period_ends[i])
+}
+
+flow_results_df <- bind_rows(flow_results_list)
+
+flow_results_df <- flow_results_df %>%
+  mutate(
+    period_label = paste(format(period_start, "%b"), format(period_end, "%b %Y"), sep = "-"),
+    period_factor = factor(period_label, levels = period_label),
+    pct_listed_with_lvad = (new_listings_with_lvad / total_new_listings) * 100
+  )
+
+# ============================================================================
+# CREATE VISUALIZATIONS
+# ============================================================================
+
+# PREVALENCE PLOTS
+plot_prev_a <- ggplot(prevalence_results_df, aes(x = date_factor, group = 1)) +
+  geom_line(aes(y = total_waitlist, color = "Total Waitlist"), linewidth = 1) +
+  geom_point(aes(y = total_waitlist, color = "Total Waitlist"), size = 3) +
+  geom_line(aes(y = total_with_lvad, color = "LVAD Support"), linewidth = 1) +
+  geom_point(aes(y = total_with_lvad, color = "LVAD Support"), size = 3) +
+  scale_color_manual(values = c("Total Waitlist" = "steelblue", "LVAD Support" = "coral")) +
+  scale_y_continuous(labels = comma, limits = c(0, NA)) +
+  labs(
+    title = "SRTR: Waitlist and LVAD-Supported Candidates Over Time",
+    x = "Date",
+    y = "Number of Candidates",
+    color = NULL
+  ) +
+  theme_classic(base_size = 15) +
+  theme(
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 15),
+    axis.text.y = element_text(size = 15),
+    axis.title.x = element_text(size = 15),
+    axis.title.y = element_text(size = 15),
+    plot.title = element_text(size = 15),
+    legend.text = element_text(size = 15)
+  )
+
+plot_prev_b <- ggplot(prevalence_results_df, aes(x = date_factor, y = lvad_proportion)) +
+  geom_col(fill = "coral", alpha = 0.7) +
+  scale_y_continuous(limits = c(0, NA)) +
+  labs(
+    title = "SRTR: Proportion of Waitlist with LVAD Support",
+    x = "Date",
+    y = "Percentage with LVAD (%)"
+  ) +
+  theme_classic(base_size = 15) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 15),
+    axis.text.y = element_text(size = 15),
+    axis.title.x = element_text(size = 15),
+    axis.title.y = element_text(size = 15),
+    plot.title = element_text(size = 15)
+  )
+
+combined_prevalence_plot <- plot_prev_a / plot_prev_b
+
+# FLOW PLOTS
+flow_plot_a <- ggplot(flow_results_df, aes(x = period_factor, group = 1)) +
+  geom_line(aes(y = new_listings_with_lvad, color = "Listed with LVAD"), linewidth = 1) +
+  geom_point(aes(y = new_listings_with_lvad, color = "Listed with LVAD"), size = 3) +
+  geom_line(aes(y = lvad_implants_on_waitlist, color = "LVAD Implanted While Listed"), linewidth = 1) +
+  geom_point(aes(y = lvad_implants_on_waitlist, color = "LVAD Implanted While Listed"), size = 3) +
+  scale_color_manual(values = c("Listed with LVAD" = "darkgreen", 
+                                "LVAD Implanted While Listed" = "purple")) +
+  scale_y_continuous(labels = comma, limits = c(0, NA)) +
+  labs(
+    title = "SRTR: LVAD Flow Dynamics",
+    x = "Time Period",
+    y = "Number of Candidates",
+    color = NULL
+  ) +
+  theme_classic(base_size = 15) +
+  theme(
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 15),
+    axis.text.y = element_text(size = 15),
+    axis.title.x = element_text(size = 15),
+    axis.title.y = element_text(size = 15),
+    plot.title = element_text(size = 15),
+    legend.text = element_text(size = 12)
+  )
+
+
+# Display plots
+print(combined_prevalence_plot)
+print(flow_plot_a)
+
+# Print summaries
+cat("\n=== SRTR PREVALENCE SUMMARY (Device File + Explant Censoring) ===\n")
+print(prevalence_results_df %>%
+        select(date, total_waitlist, total_with_lvad, lvad_proportion) %>%
+        mutate(lvad_proportion = round(lvad_proportion, 2)))
+
+cat("\n=== SRTR FLOW SUMMARY ===\n")
+print(flow_results_df %>%
+        select(period_label, new_listings_with_lvad, lvad_implants_on_waitlist, 
+               lvad_explants, total_new_listings, pct_listed_with_lvad) %>%
+        mutate(pct_listed_with_lvad = round(pct_listed_with_lvad, 2)))
+
+```
+
+
+
+
+``` {r star lvad}
+
+
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(patchwork)
+library(scales)
+
+# ============================================================================
+# STEP 1: CREATE STAR LVAD TIMELINE
+# ============================================================================
+
+lvad_keywords <- c("heartmate", "hm", "lionheart", "arrow", "jarvik", "micromed", 
+                   "debakey", "novacor", "evaheart", "worldheart", "levacor", 
+                   "reliantheart", "hvad", "heartsaver")
+
+# Get all durable LVAD devices
+star_lvads <- thoracic_mcs_device_2025q2 %>%
+  select(WL_ID_CODE, DEVICE_TYPE, LVAD_BRAND, VAD_BRAND, VENTRICULAR_SUPPORT, 
+         IMPLANT_DATE, EXPLANT_DATE, INPLACE, MCS_REM_REASON) %>%
+  filter(DEVICE_TYPE == "Dischargeable VAD" | 
+         (DEVICE_TYPE == "LVAD" & grepl(paste(lvad_keywords, collapse = "|"), 
+                                        LVAD_BRAND, ignore.case = TRUE))) %>%
+  filter(VENTRICULAR_SUPPORT != "Single" & VENTRICULAR_SUPPORT != "Right") %>%
+  # Get first implant and last explant per patient
+  group_by(WL_ID_CODE) %>%
+  arrange(IMPLANT_DATE) %>%
+  summarize(
+    first_lvad_implant = first(IMPLANT_DATE),
+    last_explant = ifelse(all(is.na(EXPLANT_DATE)), 
+                          NA_real_, 
+                          max(EXPLANT_DATE, na.rm = TRUE)),
+    still_inplace = any(INPLACE == "Y", na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    # If still in place, set explant to NA
+    lvad_explant_date = ifelse(still_inplace, NA, last_explant),
+    lvad_explant_date = as.Date(lvad_explant_date, origin = "1970-01-01")
+  )
+
+cat("STAR: Total patients with durable LVAD:", nrow(star_lvads), "\n")
+cat("STAR: Patients with explant:", sum(!is.na(star_lvads$lvad_explant_date)), "\n")
+
+# ============================================================================
+# PREVALENCE ANALYSIS: LVAD SUPPORT AT SPECIFIC TIMEPOINTS
+# ============================================================================
+
+dates_to_check <- c(
+  mdy("10-18-2018"),
+  seq(mdy("01-01-2019"), mdy("07-01-2025"), by = "2 months") - days(1)
+)
+
+get_star_lvad_prevalence <- function(check_date) {
+  
+  cat("Processing STAR date:", format(check_date, "%Y-%m-%d"), "\n")
+  
+  # Get all candidates on waitlist on this date
+  candidates_on_date <- thoracic_data_2025q2 %>%
+    filter(INIT_DATE <= check_date) %>%
+    filter(is.na(END_DATE) | END_DATE > check_date) %>%
+    filter(INIT_AGE > 17) %>%
+    select(WL_ID_CODE, INIT_DATE, END_DATE)
+  
+  # Join with LVAD timeline
+  candidates_with_lvad <- candidates_on_date %>%
+    left_join(star_lvads, by = "WL_ID_CODE") %>%
+    mutate(
+      has_lvad = !is.na(first_lvad_implant) & 
+                 first_lvad_implant <= check_date &
+                 (is.na(lvad_explant_date) | lvad_explant_date > check_date)
+    )
+  
+  total_waitlist <- nrow(candidates_on_date)
+  total_with_lvad <- sum(candidates_with_lvad$has_lvad, na.rm = TRUE)
+  
+  return(data.frame(
+    date = check_date,
+    total_waitlist = total_waitlist,
+    total_with_lvad = total_with_lvad
+  ))
+}
+
+# Run prevalence analysis
+star_prevalence_list <- lapply(dates_to_check, get_star_lvad_prevalence)
+star_prevalence_df <- bind_rows(star_prevalence_list)
+
+star_prevalence_df <- star_prevalence_df %>%
+  mutate(
+    lvad_proportion = total_with_lvad / total_waitlist * 100,
+    date_label = format(date, "%b %d, %Y"),
+    date_factor = factor(date_label, levels = date_label)
+  )
+
+# ============================================================================
+# FLOW ANALYSIS: 2-MONTH PERIODS
+# ============================================================================
+
+period_starts <- seq(mdy("01-01-2019"), mdy("06-01-2025"), by = "2 months")
+period_ends <- period_starts %m+% months(2) - days(1)
+
+get_star_lvad_flow <- function(start_date, end_date) {
+  
+  cat("Processing STAR period:", format(start_date, "%Y-%m-%d"), "to", 
+      format(end_date, "%Y-%m-%d"), "\n")
+  
+  # Get all candidates on waitlist during this period
+  candidates_in_period <- thoracic_data_2025q2 %>%
+    filter(INIT_DATE <= end_date) %>%
+    filter(is.na(END_DATE) | END_DATE > start_date) %>%
+    filter(INIT_AGE > 17) %>%
+    select(WL_ID_CODE, INIT_DATE, END_DATE)
+  
+  # Join with LVAD info
+  candidates_with_lvad <- candidates_in_period %>%
+    left_join(star_lvads, by = "WL_ID_CODE")
+  
+  # 1. NEW LISTINGS WITH LVAD (listed during period, already had LVAD at listing)
+  new_listings_with_lvad <- candidates_with_lvad %>%
+    filter(INIT_DATE >= start_date & INIT_DATE <= end_date) %>%
+    filter(!is.na(first_lvad_implant) & first_lvad_implant <= INIT_DATE) %>%
+    nrow()
+  
+  # 2. LVAD IMPLANTS WHILE ON WAITLIST (got LVAD during period, already on waitlist)
+  lvad_implants_on_waitlist <- candidates_with_lvad %>%
+    filter(!is.na(first_lvad_implant)) %>%
+    filter(first_lvad_implant >= start_date & first_lvad_implant <= end_date) %>%
+    filter(first_lvad_implant > INIT_DATE) %>%
+    nrow()
+  
+  # 3. LVAD EXPLANTS DURING PERIOD
+  lvad_explants <- candidates_with_lvad %>%
+    filter(!is.na(lvad_explant_date)) %>%
+    filter(lvad_explant_date >= start_date & lvad_explant_date <= end_date) %>%
+    nrow()
+  
+  # Total new listings
+  total_new_listings <- candidates_with_lvad %>%
+    filter(INIT_DATE >= start_date & INIT_DATE <= end_date) %>%
+    nrow()
+  
+  return(data.frame(
+    period_start = start_date,
+    period_end = end_date,
+    new_listings_with_lvad = new_listings_with_lvad,
+    lvad_implants_on_waitlist = lvad_implants_on_waitlist,
+    lvad_explants = lvad_explants,
+    total_new_listings = total_new_listings
+  ))
+}
+
+# Run flow analysis
+star_flow_list <- list()
+for (i in 1:length(period_starts)) {
+  star_flow_list[[i]] <- get_star_lvad_flow(period_starts[i], period_ends[i])
+}
+
+star_flow_df <- bind_rows(star_flow_list)
+
+star_flow_df <- star_flow_df %>%
+  mutate(
+    period_label = paste(format(period_start, "%b"), format(period_end, "%b %Y"), sep = "-"),
+    period_factor = factor(period_label, levels = period_label),
+    pct_listed_with_lvad = (new_listings_with_lvad / total_new_listings) * 100
+  )
+
+# ============================================================================
+# CREATE VISUALIZATIONS
+# ============================================================================
+
+# PREVALENCE PLOTS
+star_plot_prev_a <- ggplot(star_prevalence_df, aes(x = date_factor, group = 1)) +
+  geom_line(aes(y = total_waitlist, color = "Total Waitlist"), linewidth = 1) +
+  geom_point(aes(y = total_waitlist, color = "Total Waitlist"), size = 3) +
+  geom_line(aes(y = total_with_lvad, color = "LVAD Support"), linewidth = 1) +
+  geom_point(aes(y = total_with_lvad, color = "LVAD Support"), size = 3) +
+  scale_color_manual(values = c("Total Waitlist" = "steelblue", "LVAD Support" = "coral")) +
+  scale_y_continuous(labels = comma, limits = c(0, NA)) +
+  labs(
+    title = "STAR: Waitlist and LVAD-Supported Candidates Over Time",
+    x = "Date",
+    y = "Number of Candidates",
+    color = NULL
+  ) +
+  theme_classic(base_size = 15) +
+  theme(
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 15),
+    axis.text.y = element_text(size = 15),
+    axis.title.x = element_text(size = 15),
+    axis.title.y = element_text(size = 15),
+    plot.title = element_text(size = 15),
+    legend.text = element_text(size = 15)
+  )
+
+star_plot_prev_b <- ggplot(star_prevalence_df, aes(x = date_factor, y = lvad_proportion)) +
+  geom_col(fill = "coral", alpha = 0.7) +
+  scale_y_continuous(limits = c(0, NA)) +
+  labs(
+    title = "STAR: Proportion of Waitlist with LVAD Support",
+    x = "Date",
+    y = "Percentage with LVAD (%)"
+  ) +
+  theme_classic(base_size = 15) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 15),
+    axis.text.y = element_text(size = 15),
+    axis.title.x = element_text(size = 15),
+    axis.title.y = element_text(size = 15),
+    plot.title = element_text(size = 15)
+  )
+
+star_combined_prevalence <- star_plot_prev_a / star_plot_prev_b
+
+# FLOW PLOTS
+star_flow_plot_a <- ggplot(star_flow_df, aes(x = period_factor, group = 1)) +
+  geom_line(aes(y = new_listings_with_lvad, color = "Listed with LVAD"), linewidth = 1) +
+  geom_point(aes(y = new_listings_with_lvad, color = "Listed with LVAD"), size = 3) +
+  geom_line(aes(y = lvad_implants_on_waitlist, color = "LVAD Implanted While Listed"), linewidth = 1) +
+  geom_point(aes(y = lvad_implants_on_waitlist, color = "LVAD Implanted While Listed"), size = 3) +
+  scale_color_manual(values = c("Listed with LVAD" = "darkgreen", 
+                                "LVAD Implanted While Listed" = "purple")) +
+  scale_y_continuous(labels = comma, limits = c(0, NA)) +
+  labs(
+    title = "STAR: LVAD Flow Dynamics",
+    x = "Time Period",
+    y = "Number of Candidates",
+    color = NULL
+  ) +
+  theme_classic(base_size = 15) +
+  theme(
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 15),
+    axis.text.y = element_text(size = 15),
+    axis.title.x = element_text(size = 15),
+    axis.title.y = element_text(size = 15),
+    plot.title = element_text(size = 15),
+    legend.text = element_text(size = 12)
+  )
+
+
+srtr_star_combined_incidence <- flow_plot_a / star_flow_plot_a
+
+
+
+# Summaries
+cat("\n=== STAR PREVALENCE SUMMARY ===\n")
+print(star_prevalence_df %>%
+        select(date, total_waitlist, total_with_lvad, lvad_proportion) %>%
+        mutate(lvad_proportion = round(lvad_proportion, 2)))
+
+cat("\n=== STAR FLOW SUMMARY ===\n")
+print(star_flow_df %>%
+        select(period_label, new_listings_with_lvad, lvad_implants_on_waitlist, 
+               lvad_explants, total_new_listings, pct_listed_with_lvad) %>%
+        mutate(pct_listed_with_lvad = round(pct_listed_with_lvad, 2)))
+
+
+
+```
+
+
+
+
+``` {r combined}
+
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(scales)
+
+# ============================================================================
+# COMBINE SRTR AND STAR PREVALENCE DATA
+# ============================================================================
+
+# Prepare SRTR prevalence (assuming you have prevalence_results_df from SRTR code)
+srtr_prev_comparison <- prevalence_results_df %>%
+  select(date, total_waitlist, total_with_lvad, lvad_proportion, date_label) %>%
+  mutate(data_source = "SRTR")
+
+# Prepare STAR prevalence
+star_prev_comparison <- star_prevalence_df %>%
+  select(date, total_waitlist, total_with_lvad, lvad_proportion, date_label) %>%
+  mutate(data_source = "STAR")
+
+# Combine
+combined_prevalence <- bind_rows(srtr_prev_comparison, star_prev_comparison) %>%
+  mutate(
+    date_factor = factor(date_label, levels = unique(date_label)),
+    data_source = factor(data_source, levels = c("SRTR", "STAR"))
+  )
+
+# ============================================================================
+# CREATE COMBINED PREVALENCE COMPARISON PLOTS
+# ============================================================================
+
+# Plot 1: Absolute LVAD counts
+prev_comparison_lvad <- ggplot(combined_prevalence, aes(x = date_factor, group = data_source)) +
+  geom_line(aes(y = total_with_lvad, color = data_source, linetype = data_source), 
+            linewidth = 1.2) +
+  geom_point(aes(y = total_with_lvad, color = data_source, shape = data_source), 
+             size = 2.5) +
+  scale_color_manual(values = c("SRTR" = "coral", "STAR" = "steelblue")) +
+  scale_linetype_manual(values = c("SRTR" = "solid", "STAR" = "dashed")) +
+  scale_shape_manual(values = c("SRTR" = 16, "STAR" = 17)) +
+  scale_y_continuous(labels = comma, limits = c(0, NA)) +
+  labs(
+    #title = "LVAD-Supported Candidates: SRTR vs STAR",
+    #subtitle = "STAR systematically underreports LVAD prevalence",
+    x = "Date",
+    y = "Number of Candidates\nwith LVADs",
+    color = "Data Source",
+    linetype = "Data Source",
+    shape = "Data Source"
+  ) +
+  theme_classic(base_size = 15) +
+  theme(
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 15),
+    axis.text.y = element_text(size = 15),
+    axis.title.x = element_text(size = 15),
+    axis.title.y = element_text(size = 15),
+    plot.title = element_text(size = 15, face = "bold"),
+    plot.subtitle = element_text(size = 15),
+    legend.text = element_text(size = 15)
+  )
+
+# Plot 2: Proportion side-by-side bars
+prev_comparison_proportion <- ggplot(combined_prevalence, 
+                                     aes(x = date_factor, y = lvad_proportion, fill = data_source)) +
+  geom_col(position = "dodge", alpha = 1) +
+  scale_fill_manual(values = c("SRTR" = "coral", "STAR" = "steelblue")) +
+  scale_y_continuous(limits = c(0, NA)) +
+  labs(
+    #title = "Proportion of Waitlist with LVAD Support",
+    x = "Date",
+    y = "% of Waitlist\nwith LVADs",
+    fill = "Data Source"
+  ) +
+  theme_classic(base_size = 15) +
+  theme(
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 15),
+    axis.text.y = element_text(size = 15),
+    axis.title.x = element_text(size = 15),
+    axis.title.y = element_text(size = 15),
+    plot.title = element_text(size = 15),
+    legend.text = element_text(size = 15)
+  )
+
+# Combine plots
+combined_prev_comparison_plot <- (prev_comparison_lvad + ggtitle("A")) / 
+  (prev_comparison_proportion + ggtitle("B")) +
+  plot_layout(guides = "collect") &
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(size = 18, face = "bold", hjust = 0)
+  )
+
+print(combined_prev_comparison_plot)
+
+# ============================================================================
+# CALCULATE DISCREPANCY STATISTICS
+# ============================================================================
+
+prevalence_discrepancy <- combined_prevalence %>%
+  select(date, date_label, data_source, total_with_lvad, lvad_proportion) %>%
+  tidyr::pivot_wider(
+    names_from = data_source,
+    values_from = c(total_with_lvad, lvad_proportion)
+  ) %>%
+  mutate(
+    absolute_missing = total_with_lvad_SRTR - total_with_lvad_STAR,
+    pct_missing = (absolute_missing / total_with_lvad_SRTR) * 100,
+    proportion_gap = lvad_proportion_SRTR - lvad_proportion_STAR
+  )
+
+cat("\n=== PREVALENCE UNDERREPORTING IN STAR ===\n")
+cat("\nOverall statistics:\n")
+cat("Mean LVAD patients missing in STAR:", round(mean(prevalence_discrepancy$absolute_missing, na.rm = TRUE), 0), "\n")
+cat("Mean % underreported:", round(mean(prevalence_discrepancy$pct_missing, na.rm = TRUE), 1), "%\n")
+cat("Median % underreported:", round(median(prevalence_discrepancy$pct_missing, na.rm = TRUE), 1), "%\n")
+
+
+```
+
+``` {r flow combined_cohort}
+
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(scales)
+library(tidyr)
+
+# ============================================================================
+# COMBINE SRTR AND STAR FLOW DATA
+# ============================================================================
+
+# Prepare SRTR flow data
+srtr_flow_comparison <- flow_results_df %>%
+  select(period_label, period_factor, new_listings_with_lvad, lvad_implants_on_waitlist) %>%
+  mutate(data_source = "SRTR")
+
+# Prepare STAR flow data
+star_flow_comparison <- star_flow_df %>%
+  select(period_label, period_factor, new_listings_with_lvad, lvad_implants_on_waitlist) %>%
+  mutate(data_source = "STAR")
+
+# Combine
+combined_flow <- bind_rows(srtr_flow_comparison, star_flow_comparison) %>%
+  mutate(data_source = factor(data_source, levels = c("SRTR", "STAR")))
+
+# ============================================================================
+# CREATE COMBINED FLOW PLOT
+# ============================================================================
+
+combined_flow_plot <- ggplot(combined_flow, aes(x = period_factor, group = interaction(data_source))) +
+  # Listed with LVAD
+  geom_line(aes(y = new_listings_with_lvad, color = data_source, linetype = "Listed with LVAD"), 
+            linewidth = 1.2) +
+  geom_point(aes(y = new_listings_with_lvad, color = data_source, shape = data_source), 
+             size = 2.5) +
+  # LVAD Implanted While Listed
+  geom_line(aes(y = lvad_implants_on_waitlist, color = data_source, linetype = "LVAD Implanted While Listed"), 
+            linewidth = 1.2) +
+  geom_point(aes(y = lvad_implants_on_waitlist, color = data_source, shape = data_source), 
+             size = 2.5) +
+  scale_color_manual(values = c("SRTR" = "coral", "STAR" = "steelblue"),
+                     name = "Data Source") +
+  scale_linetype_manual(values = c("Listed with LVAD" = "solid", 
+                                   "LVAD Implanted While Listed" = "dashed"),
+                        name = "Event Type") +
+  scale_shape_manual(values = c("SRTR" = 16, "STAR" = 17),
+                     name = "Data Source") +
+  scale_y_continuous(labels = comma, limits = c(0, NA)) +
+  labs(
+    #title = "LVAD Flow Dynamics: SRTR vs STAR",
+    #subtitle = "STAR systematically underreports 'Listed with LVAD'",
+    x = "Time Period",
+    y = "Number of Candidates"
+  ) +
+  theme_classic(base_size = 15) +
+  theme(
+    legend.position = "bottom",
+    legend.box = "vertical",
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 15),
+    axis.text.y = element_text(size = 15),
+    axis.title.x = element_text(size = 15),
+    axis.title.y = element_text(size = 15),
+    plot.title = element_text(size = 16, face = "bold"),
+    plot.subtitle = element_text(size = 13),
+    legend.text = element_text(size = 15)
+  )
+
+print(combined_flow_plot)
+
+# ============================================================================
+# CALCULATE FLOW DISCREPANCY STATISTICS
+# ============================================================================
+
+flow_discrepancy <- combined_flow %>%
+  select(period_label, data_source, new_listings_with_lvad, lvad_implants_on_waitlist) %>%
+  pivot_wider(
+    names_from = data_source,
+    values_from = c(new_listings_with_lvad, lvad_implants_on_waitlist)
+  ) %>%
+  mutate(
+    listed_missing = new_listings_with_lvad_SRTR - new_listings_with_lvad_STAR,
+    listed_pct_missing = (listed_missing / new_listings_with_lvad_SRTR) * 100,
+    implanted_diff = lvad_implants_on_waitlist_SRTR - lvad_implants_on_waitlist_STAR
+  )
+
+cat("\n=== FLOW UNDERREPORTING IN STAR ===\n")
+cat("\nListed with LVAD:\n")
+cat("Mean missing in STAR:", round(mean(flow_discrepancy$listed_missing, na.rm = TRUE), 0), "\n")
+cat("Mean % underreported:", round(mean(flow_discrepancy$listed_pct_missing, na.rm = TRUE), 1), "%\n")
+
+cat("\nLVAD Implanted While Listed:\n")
+cat("Mean difference:", round(mean(flow_discrepancy$implanted_diff, na.rm = TRUE), 0), "\n")
+
+
+```
+
+
+
+
+``` {r outcomes}
+
+library(dplyr)
+library(lubridate)
+library(tidycmprsk)
+library(ggplot2)
+library(scales)
+library(survival)
+library(ggsurvfit)
+
+# ============================================================================
+# DEFINE LVAD COHORTS FROM DEVICE FILES
+# ============================================================================
+
+lvad_keywords <- c("heartmate", "hm", "lionheart", "arrow", "jarvik", "micromed", 
+                   "debakey", "novacor", "evaheart", "worldheart", "levacor", 
+                   "reliantheart", "hvad", "heartsaver")
+
+# ============================================================================
+# SRTR COHORT
+# ============================================================================
+
+# Get LVAD implants in study period
+srtr_lvad_devices <- thor_support_device %>%
+  filter(VadBrandId %in% c('202', '205', '206', '207', '208', '209', '210', '212', 
+                           '213', '214', '223', '224', '233', '236', '239', '240', 
+                           '312', '313', '314', '315', '316', '319', '322', '327', 
+                           '330', '333', '334') | 
+           (VadBrandId == 999 & grepl(paste(lvad_keywords, collapse = "|"), 
+                                      OtherSpecify, ignore.case = TRUE))) %>%
+  group_by(PX_ID) %>%
+  arrange(ImplantDt) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(PX_ID, lvad_implant_date = ImplantDt) %>%
+  filter(lvad_implant_date >= mdy("10-18-2018") & 
+           lvad_implant_date <= mdy("12-31-2024"))
+
+cat("SRTR LVAD implants in study period:", nrow(srtr_lvad_devices), "\n")
+
+# Get status history to identify explants (Status 5/6 with no return to Status 1-4)
+status_history <- stathist_thor2025q2 %>%
+  select(PX_ID, CANHX_BEGIN_DT, CANHX_END_DT, CANHX_STAT_CD) %>%
+  mutate(
+    status_numeric = case_when(
+      CANHX_STAT_CD %in% c(1110, 2110) ~ 1,
+      CANHX_STAT_CD %in% c(1120, 2120) ~ 2,
+      CANHX_STAT_CD %in% c(1130, 2130) ~ 3,
+      CANHX_STAT_CD %in% c(1140, 2140) ~ 4,
+      CANHX_STAT_CD %in% c(1150, 2150) ~ 5,
+      CANHX_STAT_CD %in% c(1160, 2160) ~ 6,
+      TRUE ~ 99
+    )
+  ) %>%
+  inner_join(srtr_lvad_devices, by = "PX_ID") %>%
+  filter(CANHX_BEGIN_DT >= lvad_implant_date) %>%
+  arrange(PX_ID, CANHX_BEGIN_DT)
+
+# Identify presumed explants: Status 5/6 with no return to Status 1-4
+first_status56 <- status_history %>%
+  filter(status_numeric %in% c(5, 6)) %>%
+  group_by(PX_ID) %>%
+  arrange(CANHX_BEGIN_DT) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(PX_ID, first_56_date = CANHX_BEGIN_DT)
+
+returned_to_active <- status_history %>%
+  inner_join(first_status56, by = "PX_ID") %>%
+  filter(status_numeric %in% c(1, 2, 3, 4) & CANHX_BEGIN_DT > first_56_date) %>%
+  distinct(PX_ID)
+
+srtr_explant_dates <- first_status56 %>%
+  filter(!PX_ID %in% returned_to_active$PX_ID) %>%
+  select(PX_ID, explant_date = first_56_date)
+
+cat("SRTR patients with presumed explant:", nrow(srtr_explant_dates), "\n")
+
+# Build outcomes cohort
+srtr_lvad_outcomes <- srtr_lvad_devices %>%
+  inner_join(
+    cand_thor2025q2 %>% 
+      select(PX_ID, CAN_LISTING_DT, CAN_REM_DT, CAN_REM_CD, CAN_AGE_IN_MONTHS_AT_LISTING,
+             CAN_LAST_ACT_STAT_DT, CAN_LAST_INACT_STAT_DT),
+    by = "PX_ID"
+  ) %>%
+  left_join(srtr_explant_dates, by = "PX_ID") %>%
+  filter(CAN_AGE_IN_MONTHS_AT_LISTING / 12 > 17) %>%
+  mutate(
+    # First determine removal/censoring date
+    removal_or_censor_date = case_when(
+      !is.na(CAN_REM_DT) ~ as.Date(CAN_REM_DT),
+      TRUE ~ pmax(as.Date(CAN_LAST_ACT_STAT_DT), 
+                  as.Date(CAN_LAST_INACT_STAT_DT), 
+                  na.rm = TRUE)
+    ),
+    removal_or_censor_date = if_else(is.na(removal_or_censor_date), 
+                                     as.Date("2025-06-30"), 
+                                     removal_or_censor_date),
+    
+    # Use explant date if it occurred before removal/censoring
+    end_date = case_when(
+      !is.na(explant_date) & explant_date < removal_or_censor_date ~ explant_date,
+      TRUE ~ removal_or_censor_date
+    ),
+    
+    followup_time = as.numeric(difftime(end_date, lvad_implant_date, units = "days")) / 365.25,
+    
+    # Event coding: prioritize explantation if it occurred
+    event = case_when(
+      !is.na(explant_date) & explant_date < removal_or_censor_date ~ 3,  # Explanted
+      CAN_REM_CD %in% c(8, 13) ~ 1,  # Death/Deterioration
+      CAN_REM_CD == 4 ~ 2,  # Transplant
+      TRUE ~ 0  # Censored
+    ),
+    event_factor = factor(event, levels = c(0, 1, 2, 3),
+                          labels = c("Censored", "Death/Deterioration", "Transplant", "Explanted")),
+    data_source = "SRTR"
+  ) %>%
+  filter(followup_time >= 0)
+
+cat("SRTR cohort:", nrow(srtr_lvad_outcomes), "patients\n")
+cat("  Deaths/Deterioration:", sum(srtr_lvad_outcomes$event == 1), "\n")
+cat("  Transplants:", sum(srtr_lvad_outcomes$event == 2), "\n")
+cat("  Explanted:", sum(srtr_lvad_outcomes$event == 3), "\n")
+cat("  Censored:", sum(srtr_lvad_outcomes$event == 0), "\n")
+
+# ============================================================================
+# STAR COHORT
+# ============================================================================
+
+star_lvad_devices <- thoracic_mcs_device_2025q2 %>%
+  filter(DEVICE_TYPE == "Dischargeable VAD" | 
+           (DEVICE_TYPE == "LVAD" & grepl(paste(lvad_keywords, collapse = "|"), 
+                                          LVAD_BRAND, ignore.case = TRUE))) %>%
+  filter(VENTRICULAR_SUPPORT != "Single" & VENTRICULAR_SUPPORT != "Right") %>%
+  group_by(WL_ID_CODE) %>%
+  arrange(IMPLANT_DATE) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(WL_ID_CODE, lvad_implant_date = IMPLANT_DATE, explant_date = EXPLANT_DATE) %>%
+  mutate(
+    lvad_implant_date = as.Date(lvad_implant_date, origin = "1970-01-01"),
+    explant_date = as.Date(explant_date, origin = "1970-01-01")
+  ) %>%
+  filter(lvad_implant_date >= mdy("10-18-2018") & 
+           lvad_implant_date <= mdy("12-31-2024"))
+
+cat("\nOPTN STAR LVAD implants in study period:", nrow(star_lvad_devices), "\n")
+
+star_lvad_outcomes <- star_lvad_devices %>%
+  inner_join(
+    thoracic_data_2025q2 %>% 
+      select(WL_ID_CODE, INIT_DATE, END_DATE, REM_CD, INIT_AGE),
+    by = "WL_ID_CODE"
+  ) %>%
+  filter(INIT_AGE > 17) %>%
+  mutate(
+    removal_or_censor_date = if_else(is.na(END_DATE), 
+                                     as.Date("2025-06-30"), 
+                                     as.Date(END_DATE)),
+    
+    # Use explant date if it occurred before removal/censoring
+    end_date = case_when(
+      !is.na(explant_date) & explant_date < removal_or_censor_date ~ explant_date,
+      TRUE ~ removal_or_censor_date
+    ),
+    
+    followup_time = as.numeric(difftime(end_date, lvad_implant_date, units = "days")) / 365.25,
+    
+    # Event coding: prioritize explantation if it occurred
+    event = case_when(
+      !is.na(explant_date) & explant_date < removal_or_censor_date ~ 3,  # Explanted
+      REM_CD %in% c(8, 13) ~ 1,  # Death/Deterioration
+      REM_CD == 4 ~ 2,  # Transplant
+      TRUE ~ 0  # Censored
+    ),
+    event_factor = factor(event, levels = c(0, 1, 2, 3),
+                          labels = c("Censored", "Death/Deterioration", "Transplant", "Explanted")),
+    data_source = "OPTN STAR"
+  ) %>%
+  filter(followup_time > 0)
+
+cat("OPTN STAR cohort:", nrow(star_lvad_outcomes), "patients\n")
+cat("  Deaths/Deterioration:", sum(star_lvad_outcomes$event == 1), "\n")
+cat("  Transplants:", sum(star_lvad_outcomes$event == 2), "\n")
+cat("  Explanted:", sum(star_lvad_outcomes$event == 3), "\n")
+cat("  Censored:", sum(star_lvad_outcomes$event == 0), "\n")
+
+# ============================================================================
+# COMBINE AND ANALYZE - INCLUDE EXPLANTATION AS COMPETING RISK
+# ============================================================================
+
+combined_cohort <- bind_rows(
+  srtr_lvad_outcomes %>% select(followup_time, event_factor, data_source),
+  star_lvad_outcomes %>% select(followup_time, event_factor, data_source)
+) %>%
+  mutate(data_source = factor(data_source, levels = c("SRTR", "OPTN STAR")))
+
+cat("\nCombined cohort:", nrow(combined_cohort), "patients\n")
+
+# Competing risks analysis - INCLUDE ALL THREE COMPETING RISKS
+cif_fit <- cuminc(Surv(followup_time, event_factor) ~ data_source, 
+                  data = combined_cohort)
+
+# Fine-Gray tests for each outcome
+fg_transplant <- crr(Surv(followup_time, event_factor) ~ data_source,
+                     data = combined_cohort,
+                     failcode = "Transplant")
+
+fg_death <- crr(Surv(followup_time, event_factor) ~ data_source,
+                data = combined_cohort,
+                failcode = "Death/Deterioration")
+
+fg_explant <- crr(Surv(followup_time, event_factor) ~ data_source,
+                  data = combined_cohort,
+                  failcode = "Explanted")
+
+p_transplant <- tidy(fg_transplant)$p.value[1]
+p_death <- tidy(fg_death)$p.value[1]
+p_explant <- tidy(fg_explant)$p.value[1]
+
+cat("\n=== FINE-GRAY TESTS ===\n")
+cat("Transplant p-value:", format.pval(p_transplant, digits = 3), "\n")
+cat("Death/Deterioration p-value:", format.pval(p_death, digits = 3), "\n")
+cat("Explantation p-value:", format.pval(p_explant, digits = 3), "\n")
+
+# Plot only transplant and death/deterioration with Fine-Gray p-values annotated
+cif_plot <- cif_fit %>%
+  ggcuminc(
+    outcome = c("Death/Deterioration", "Transplant"),
+    linewidth = 1.2
+  ) + 
+  add_confidence_interval(alpha = 0.2) +
+  add_risktable(
+    size = 5, 
+    theme = theme_risktable_default(
+      plot.title.size = 14, 
+      axis.text.y.size = 14
+    )
+  ) +
+  scale_x_continuous(breaks = 0:6, limits = c(0, 6)) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    labels = scales::percent,
+    expand = c(0.01, 0)
+  ) +
+  xlab("Years from LVAD Implantation") +
+  ylab("Cumulative Incidence") +
+  scale_color_manual(
+    values = c("SRTR" = "coral", "OPTN STAR" = "steelblue"),
+    name = "Data Source"
+  ) +
+  scale_fill_manual(
+    values = c("SRTR" = "coral", "OPTN STAR" = "steelblue"),
+    name = "Data Source"
+  ) +
+  scale_linetype_discrete(name = "Outcome") +
+  guides(
+    color = guide_legend(order = 1, nrow = 1),
+    fill = guide_legend(order = 1, nrow = 1),
+    linetype = guide_legend(order = 2, nrow = 1)
+  ) +
+  annotate("text", x = 5.5, y = 0.95, 
+           label = paste0("Fine-Gray Transplant: ", 
+                          ifelse(p_transplant < 0.001, "p<0.001", 
+                                 paste0("p=", format.pval(p_transplant, digits = 3)))),
+           hjust = 1, size = 5, fontface = "bold") +
+  annotate("text", x = 5.5, y = 0.90,
+           label = paste0("Fine-Gray Death/Deterioration: ", 
+                          ifelse(p_death < 0.001, "p<0.001", 
+                                 paste0("p=", format.pval(p_death, digits = 3)))),
+           hjust = 1, size = 5, fontface = "bold") +
+  theme_classic() +
+  theme(
+    legend.position = "bottom",
+    legend.box = "vertical",
+    legend.title = element_text(size = 15, face = "bold"),
+    axis.text.x = element_text(size = 15),
+    axis.title.x = element_text(size = 15),
+    axis.text.y = element_text(size = 15),
+    axis.title.y = element_text(size = 15),
+    legend.text = element_text(size = 15)
+  )
+
+print(cif_plot)
+
+
+
+# Summary stats
+cat("\n=== MEDIAN FOLLOW-UP ===\n")
+cat("SRTR:", round(median(srtr_lvad_outcomes$followup_time), 2), "years\n")
+cat("STAR:", round(median(star_lvad_outcomes$followup_time), 2), "years\n")
+
+# Cumulative incidence at key timepoints
+cif_summary <- cif_fit %>%
+  tidy() %>%
+  filter(time <= 3.5) %>%
+  group_by(outcome, strata) %>%
+  filter(abs(time - 1) == min(abs(time - 1)) | 
+           abs(time - 2) == min(abs(time - 2)) |
+           abs(time - 3) == min(abs(time - 3))) %>%
+  distinct(outcome, strata, .keep_all = TRUE) %>%
+  arrange(outcome, strata, time) %>%
+  mutate(
+    time_year = round(time, 1),
+    estimate_pct = round(estimate * 100, 1)
+  ) %>%
+  select(outcome, strata, time_year, estimate_pct)
+
+cat("\n=== CUMULATIVE INCIDENCE AT 1, 2, 3 YEARS ===\n")
+print(cif_summary)
+
+
+
+```
+
+
+
+``` {r summary}
+
+library(dplyr)
+library(tidyr)
+library(knitr)
+
+# ============================================================================
+# EXTRACT CUMULATIVE INCIDENCE AT KEY TIMEPOINTS WITH CONFIDENCE INTERVALS
+# ============================================================================
+
+# Get all CIF estimates
+cif_all <- cif_fit %>%
+  tidy()
+
+# Timepoints to extract
+timepoints <- c(1, 2, 3, 4, 5, 6)
+
+# Extract CIF at each timepoint for each outcome and strata
+cif_list <- list()
+counter <- 1
+
+for (outcome_val in c("Transplant", "Death/Deterioration")) {
+  for (strata_val in c("SRTR", "OPTN STAR")) {
+    for (time_val in timepoints) {
+      
+      # Get closest CIF estimate to target time
+      closest <- cif_all %>%
+        filter(outcome == outcome_val, strata == strata_val) %>%
+        mutate(time_diff = abs(time - time_val)) %>%
+        slice_min(time_diff, n = 1) %>%
+        slice(1)  # Take only first if tied
+      
+      if (nrow(closest) > 0) {
+        cif_list[[counter]] <- data.frame(
+          outcome = outcome_val,
+          strata = strata_val,
+          target_time = time_val,
+          actual_time = closest$time[1],
+          estimate_pct = closest$estimate[1] * 100,
+          conf_low_pct = closest$conf.low[1] * 100,
+          conf_high_pct = closest$conf.high[1] * 100
+        )
+        counter <- counter + 1
+      }
+    }
+  }
+}
+
+# Combine all results and ensure uniqueness
+cif_summary_table <- bind_rows(cif_list) %>%
+  distinct(outcome, strata, target_time, .keep_all = TRUE)
+
+# Create formatted estimate with CI
+cif_summary_formatted <- cif_summary_table %>%
+  mutate(
+    estimate_ci = sprintf("%.1f (%.1f-%.1f)", estimate_pct, conf_low_pct, conf_high_pct),
+    outcome_strata = paste(outcome, strata, sep = "_")
+  )
+
+# Reshape for display - with confidence intervals
+cif_summary_wide_ci <- cif_summary_formatted %>%
+  select(target_time, outcome_strata, estimate_ci) %>%
+  distinct() %>%
+  pivot_wider(
+    names_from = outcome_strata,
+    values_from = estimate_ci
+  ) %>%
+  rename(
+    `Years` = target_time,
+    `SRTR Transplant` = `Transplant_SRTR`,
+    `STAR Transplant` = `Transplant_OPTN STAR`,
+    `SRTR Death/Deterioration` = `Death/Deterioration_SRTR`,
+    `STAR Death/Deterioration` = `Death/Deterioration_OPTN STAR`
+  )
+
+# Point estimate table with differences
+cif_summary_wide <- cif_summary_table %>%
+  select(target_time, outcome, strata, estimate_pct) %>%
+  distinct() %>%
+  pivot_wider(
+    names_from = c(outcome, strata),
+    values_from = estimate_pct,
+    names_sep = "_"
+  ) %>%
+  rename(
+    `Years` = target_time,
+    `SRTR_Transplant` = `Transplant_SRTR`,
+    `STAR_Transplant` = `Transplant_OPTN STAR`,
+    `SRTR_Death` = `Death/Deterioration_SRTR`,
+    `STAR_Death` = `Death/Deterioration_OPTN STAR`
+  ) %>%
+  mutate(
+    `Transplant Difference` = `STAR_Transplant` - `SRTR_Transplant`,
+    `Death Difference` = `STAR_Death` - `SRTR_Death`
+  ) %>%
+  mutate(across(where(is.numeric) & !Years, ~round(., 1))) %>%
+  rename(
+    `SRTR Transplant (%)` = `SRTR_Transplant`,
+    `STAR Transplant (%)` = `STAR_Transplant`,
+    `SRTR Death (%)` = `SRTR_Death`,
+    `STAR Death (%)` = `STAR_Death`
+  )
+
+cat("\n=== CUMULATIVE INCIDENCE WITH 95% CONFIDENCE INTERVALS ===\n\n")
+print(cif_summary_wide_ci, n = Inf)
+
+cat("\n\n=== FORMATTED TABLE FOR MANUSCRIPT ===\n\n")
+kable(cif_summary_wide_ci, format = "simple", align = c('c', 'c', 'c', 'c', 'c'))
+
+cat("\n\n=== POINT ESTIMATES WITH DIFFERENCES ===\n\n")
+print(cif_summary_wide, n = Inf)
+
+# Calculate median follow-up
+cat("\n\n=== FOLLOW-UP STATISTICS ===\n")
+cat("SRTR:\n")
+cat("  Median (IQR):", round(median(srtr_lvad_outcomes$followup_time), 2), 
+    "(", round(quantile(srtr_lvad_outcomes$followup_time, 0.25), 2), "-", 
+    round(quantile(srtr_lvad_outcomes$followup_time, 0.75), 2), ") years\n")
+cat("  Max:", round(max(srtr_lvad_outcomes$followup_time), 2), "years\n")
+
+cat("\nSTAR:\n")
+cat("  Median (IQR):", round(median(star_lvad_outcomes$followup_time), 2), 
+    "(", round(quantile(star_lvad_outcomes$followup_time, 0.25), 2), "-", 
+    round(quantile(star_lvad_outcomes$followup_time, 0.75), 2), ") years\n")
+cat("  Max:", round(max(star_lvad_outcomes$followup_time), 2), "years\n")
+
+# Event counts
+cat("\n\n=== EVENT COUNTS ===\n")
+cat("\nSRTR (N=", nrow(srtr_lvad_outcomes), "):\n", sep="")
+cat("  Transplants:", sum(srtr_lvad_outcomes$event == 2), 
+    sprintf("(%.1f%%)", 100*sum(srtr_lvad_outcomes$event == 2)/nrow(srtr_lvad_outcomes)), "\n")
+cat("  Deaths/Deterioration:", sum(srtr_lvad_outcomes$event == 1), 
+    sprintf("(%.1f%%)", 100*sum(srtr_lvad_outcomes$event == 1)/nrow(srtr_lvad_outcomes)), "\n")
+cat("  Censored:", sum(srtr_lvad_outcomes$event == 0), 
+    sprintf("(%.1f%%)", 100*sum(srtr_lvad_outcomes$event == 0)/nrow(srtr_lvad_outcomes)), "\n")
+
+cat("\nSTAR (N=", nrow(star_lvad_outcomes), "):\n", sep="")
+cat("  Transplants:", sum(star_lvad_outcomes$event == 2), 
+    sprintf("(%.1f%%)", 100*sum(star_lvad_outcomes$event == 2)/nrow(star_lvad_outcomes)), "\n")
+cat("  Deaths/Deterioration:", sum(star_lvad_outcomes$event == 1), 
+    sprintf("(%.1f%%)", 100*sum(star_lvad_outcomes$event == 1)/nrow(star_lvad_outcomes)), "\n")
+cat("  Censored:", sum(star_lvad_outcomes$event == 0), 
+    sprintf("(%.1f%%)", 100*sum(star_lvad_outcomes$event == 0)/nrow(star_lvad_outcomes)), "\n")
+
+
+
+
+
+
+
+# ============================================================================
+# TEST FOR SIGNIFICANT DIFFERENCE IN FOLLOW-UP
+# ============================================================================
+
+# Wilcoxon rank-sum test (non-parametric)
+followup_test <- wilcox.test(
+  srtr_lvad_outcomes$followup_time,
+  star_lvad_outcomes$followup_time
+)
+
+cat("\n=== COMPARISON OF FOLLOW-UP TIMES ===\n\n")
+cat("SRTR median follow-up:", round(median(srtr_lvad_outcomes$followup_time), 3), "years\n")
+cat("STAR median follow-up:", round(median(star_lvad_outcomes$followup_time), 3), "years\n")
+cat("Difference:", round(median(srtr_lvad_outcomes$followup_time) - median(star_lvad_outcomes$followup_time), 2), "years\n")
+
+cat("\nWilcoxon rank-sum test:\n")
+cat("  W statistic:", format(followup_test$statistic, big.mark = ","), "\n")
+cat("  p-value:", format.pval(followup_test$p.value, digits = 3, eps = 0.001), "\n")
+
+data.frame(
+  cohort = c("SRTR", "STAR"),
+  IQR = c(IQR(srtr_lvad_outcomes$followup_time), 
+          IQR(star_lvad_outcomes$followup_time)),
+  max = c(max(srtr_lvad_outcomes$followup_time), 
+          max(star_lvad_outcomes$followup_time))
+)
+
+data.frame(
+  cohort = c("SRTR", "STAR"),
+  Q1 = c(quantile(srtr_lvad_outcomes$followup_time, 0.25),
+         quantile(star_lvad_outcomes$followup_time, 0.25)),
+  Q3 = c(quantile(srtr_lvad_outcomes$followup_time, 0.75),
+         quantile(star_lvad_outcomes$followup_time, 0.75))
+)
+
+if (followup_test$p.value < 0.001) {
+  cat("  Result: STAR has SIGNIFICANTLY shorter follow-up (p<0.001)\n")
+} else if (followup_test$p.value < 0.05) {
+  cat("  Result: STAR has significantly shorter follow-up (p<0.05)\n")
+} else {
+  cat("  Result: No significant difference in follow-up\n")
+}
+
+# Effect size (Hodges-Lehmann estimator - median difference)
+cat("\n=== ADDITIONAL STATISTICS ===\n")
+cat("Mean follow-up:\n")
+cat("  SRTR:", round(mean(srtr_lvad_outcomes$followup_time), 2), "years\n")
+cat("  STAR:", round(mean(star_lvad_outcomes$followup_time), 2), "years\n")
+cat("  Difference:", round(mean(srtr_lvad_outcomes$followup_time) - mean(star_lvad_outcomes$followup_time), 2), "years\n")
+
+
+
+```
+
+
+``` {r extra summary}
+
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(scales)
+
+# ============================================================================
+# COMPARE DISTRIBUTION OF LVAD IMPLANT YEARS: SRTR vs STAR
+# ============================================================================
+
+# SRTR: Extract implant year
+srtr_implant_years <- srtr_lvad_outcomes %>%
+  mutate(
+    implant_year = year(lvad_implant_date),
+    data_source = "SRTR"
+  ) %>%
+  count(implant_year, data_source)
+
+# STAR: Extract implant year
+star_implant_years <- star_lvad_outcomes %>%
+  mutate(
+    implant_year = year(lvad_implant_date),
+    data_source = "STAR"
+  ) %>%
+  count(implant_year, data_source)
+
+# Combine
+implant_year_comparison <- bind_rows(srtr_implant_years, star_implant_years) %>%
+  group_by(data_source) %>%
+  mutate(
+    total = sum(n),
+    percentage = (n / total) * 100
+  ) %>%
+  ungroup()
+
+# Calculate absolute and percentage differences
+implant_year_wide <- implant_year_comparison %>%
+  select(implant_year, data_source, n, percentage) %>%
+  pivot_wider(
+    names_from = data_source,
+    values_from = c(n, percentage),
+    values_fill = list(n = 0, percentage = 0)
+  ) %>%
+  mutate(
+    n_difference = n_SRTR - n_STAR,
+    pct_difference = percentage_SRTR - percentage_STAR,
+    star_capture_rate = (n_STAR / n_SRTR) * 100
+  ) %>%
+  arrange(implant_year)
+
+cat("\n=== LVAD IMPLANT YEAR DISTRIBUTION ===\n\n")
+print(implant_year_wide, n = Inf)
+
+# ============================================================================
+# VISUALIZATION: Side-by-side bars
+# ============================================================================
+
+implant_year_plot <- ggplot(implant_year_comparison, 
+                            aes(x = factor(implant_year), y = percentage, fill = data_source)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  scale_fill_manual(values = c("SRTR" = "coral", "STAR" = "steelblue"),
+                    name = "Data Source") +
+  scale_y_continuous(limits = c(0, NA), expand = c(0, 0)) +
+  labs(
+    title = "Distribution of LVAD Implant Years: SRTR vs STAR",
+    subtitle = "STAR systematically underrepresents recent implants",
+    x = "Year of LVAD Implantation",
+    y = "Percentage of Cohort (%)"
+  ) +
+  theme_classic(base_size = 15) +
+  theme(
+    legend.position = "bottom",
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title.x = element_text(size = 14),
+    axis.title.y = element_text(size = 14),
+    plot.title = element_text(size = 16, face = "bold"),
+    plot.subtitle = element_text(size = 13),
+    legend.text = element_text(size = 12)
+  )
+
+print(implant_year_plot)
+
+# ============================================================================
+# CAPTURE RATE OVER TIME
+# ============================================================================
+
+
+# Chi-square test for difference in distributions
+contingency_table <- implant_year_comparison %>%
+  select(implant_year, data_source, n) %>%
+  pivot_wider(names_from = data_source, values_from = n, values_fill = 0) %>%
+  select(SRTR, STAR) %>%
+  as.matrix()
+
+chi_test <- chisq.test(contingency_table)
+
+cat("\n\n=== CHI-SQUARE TEST FOR DISTRIBUTION DIFFERENCE ===\n")
+cat("X-squared:", round(chi_test$statistic, 2), "\n")
+cat("p-value:", format.pval(chi_test$p.value, digits = 3), "\n")
+cat("Result: Distributions are", ifelse(chi_test$p.value < 0.001, "SIGNIFICANTLY", "significantly"), 
+    "different (p<0.001)\n")
+
+
+
+
+```
+
+
+``` {r extra stuff}
+
+# ============================================================================
+# YEAR-BY-YEAR PROPORTION TESTS
+# ============================================================================
+
+# For each year, test if SRTR proportion ≠ STAR proportion
+year_by_year_tests <- implant_year_wide %>%
+  rowwise() %>%
+  mutate(
+    # Two-proportion z-test
+    prop_test = list(prop.test(
+      x = c(n_SRTR, n_STAR),
+      n = c(sum(implant_year_wide$n_SRTR), sum(implant_year_wide$n_STAR)),
+      correct = FALSE
+    )),
+    p_value = prop_test$p.value,
+    significant = p_value < 0.05
+  ) %>%
+  ungroup() %>%
+  select(implant_year, n_SRTR, n_STAR, percentage_SRTR, percentage_STAR, 
+         pct_difference, p_value, significant) %>%
+  mutate(
+    p_formatted = ifelse(p_value < 0.001, "p<0.001", sprintf("p=%.3f", p_value)),
+    sig_marker = ifelse(significant, "*", "")
+  )
+
+cat("\n=== YEAR-BY-YEAR PROPORTION TESTS ===\n\n")
+print(year_by_year_tests %>% select(implant_year, percentage_SRTR, percentage_STAR, 
+                                     pct_difference, p_formatted, sig_marker), 
+      n = Inf)
+
+# Add significance markers to the plot
+implant_year_plot_with_sig <- implant_year_comparison %>%
+  left_join(
+    year_by_year_tests %>% select(implant_year, p_value, sig_marker),
+    by = "implant_year"
+  ) %>%
+  group_by(implant_year) %>%
+  mutate(max_pct = max(percentage)) %>%
+  ungroup() %>%
+  ggplot(aes(x = factor(implant_year), y = percentage, fill = data_source)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  geom_text(
+    data = . %>% filter(data_source == "SRTR"),
+    aes(x = factor(implant_year), y = max_pct + 2, label = sig_marker),
+    size = 6, inherit.aes = FALSE
+  ) +
+  scale_fill_manual(values = c("SRTR" = "coral", "STAR" = "steelblue"),
+                    name = "Data Source") +
+  scale_y_continuous(limits = c(0, NA), expand = expansion(mult = c(0, 0.1))) +
+  labs(
+    #title = "Distribution of LVAD Implant Years: SRTR vs STAR",
+    #subtitle = "STAR systematically underrepresents recent implants (* = p<0.05)",
+    x = "Year of LVAD Implantation",
+    y = "Percentage of Cohort (%)"
+  ) +
+  theme_classic(base_size = 15) +
+  theme(
+    legend.position = "bottom",
+    axis.text.x = element_text(size = 15),
+    axis.text.y = element_text(size = 15),
+    axis.title.x = element_text(size = 15),
+    axis.title.y = element_text(size = 15),
+    plot.title = element_text(size = 16, face = "bold"),
+    plot.subtitle = element_text(size = 13),
+    legend.text = element_text(size = 15)
+  )
+
+print(implant_year_plot_with_sig)
+
+
+# Chi-square test for difference in distributions
+contingency_table <- implant_year_comparison %>%
+  select(implant_year, data_source, n) %>%
+  pivot_wider(names_from = data_source, values_from = n, values_fill = 0) %>%
+  select(SRTR, STAR) %>%
+  as.matrix()
+
+chi_test <- chisq.test(contingency_table)
+
+cat("\n\n=== CHI-SQUARE TEST FOR DISTRIBUTION DIFFERENCE ===\n")
+cat("X-squared:", round(chi_test$statistic, 2), "\n")
+cat("p-value:", format.pval(chi_test$p.value, digits = 3), "\n")
+cat("Result: Distributions are", ifelse(chi_test$p.value < 0.001, "SIGNIFICANTLY", "significantly"), 
+    "different (p<0.001)\n")
+
+
+
+
+
+
+```
+
+
+
+``` {r fortable 1}
+
+library(dplyr)
+library(gtsummary)
+library(labelled)
+
+# Define LVAD keywords
+lvad_keywords <- c("heartmate", "hm", "lionheart", "arrow", "jarvik", "micromed", 
+                   "debakey", "novacor", "evaheart", "worldheart", "levacor", 
+                   "reliantheart", "hvad", "heartsaver")
+
+# ============================================================================
+# PREPARE SRTR TABLE 1 DATA
+# ============================================================================
+
+srtr_table1 <- srtr_lvad_outcomes %>%
+  select(PX_ID, lvad_implant_date) %>%
+  left_join(
+    cand_thor2025q2 %>%
+      select(PX_ID, CAN_GENDER, CAN_RACE, CAN_ETHNICITY_SRTR, 
+             CAN_AGE_IN_MONTHS_AT_LISTING, CAN_BMI, CAN_ABO, 
+             CAN_DGN, CAN_PRIMARY_PAY, CAN_LISTING_DT),
+    by = "PX_ID"
+  ) %>%
+  left_join(
+    thor_support_device %>%
+      filter(VadBrandId %in% c('202', '205', '206', '207', '208', '209', '210', '212', 
+                               '213', '214', '223', '224', '233', '236', '239', '240', 
+                               '312', '313', '314', '315', '316', '319', '322', '327', 
+                               '330', '333', '334')) %>%
+      group_by(PX_ID) %>%
+      arrange(ImplantDt) %>%
+      slice(1) %>%
+      ungroup() %>%
+      select(PX_ID, VadBrandId),
+    by = "PX_ID"
+  ) %>%
+  mutate(
+    data_source = "SRTR",
+    age_at_listing = floor(CAN_AGE_IN_MONTHS_AT_LISTING / 12),
+    age_at_lvad = floor(CAN_AGE_IN_MONTHS_AT_LISTING / 12) + 
+      as.numeric(difftime(lvad_implant_date, CAN_LISTING_DT, units = "days")) / 365.25,
+    age_at_lvad = floor(age_at_lvad),
+    sex = ifelse(CAN_GENDER == "M", "Male", "Female"),
+    sex = factor(sex, levels = c("Male", "Female")),
+    race = case_when(
+      is.na(CAN_RACE) & CAN_ETHNICITY_SRTR == "LATINO" ~ "Hispanic/Latino",
+      CAN_RACE == 8 & CAN_ETHNICITY_SRTR == "NLATIN" ~ "White",
+      CAN_RACE == 16 & CAN_ETHNICITY_SRTR == "NLATIN" ~ "Black",
+      CAN_RACE == 64 & CAN_ETHNICITY_SRTR == "NLATIN" ~ "Asian",
+      TRUE ~ "Other"),
+    race = factor(race, levels = c("White", "Black", "Hispanic/Latino", "Asian", "Other")),
+    bmi_categories = case_when(
+      CAN_BMI < 18 ~ "Underweight",
+      CAN_BMI >= 18 & CAN_BMI < 25 ~ "Normal",
+      CAN_BMI >= 25 & CAN_BMI < 30 ~ "Overweight",
+      CAN_BMI >= 30 ~ "Obese",
+      TRUE ~ "Unknown"),
+    bmi_categories = factor(bmi_categories, levels = c("Normal", "Underweight", "Overweight", "Obese", "Unknown")),
+    blood_type = factor(
+      case_when(
+        CAN_ABO %in% c("A", "A1", "A2") ~ "A",
+        CAN_ABO %in% c("A1B", "A2B") ~ "AB",
+        TRUE ~ CAN_ABO)),
+    diagnosis = case_when(
+      CAN_DGN > 999 & CAN_DGN < 1007 ~ "Dilated Cardiomyopathy, Non-Ischemic",
+      CAN_DGN == 1007 | CAN_DGN == 1200 ~ "Ischemic Cardiomyopathy",
+      CAN_DGN > 1048 & CAN_DGN < 1100 ~ "Restrictive Cardiomyopathy",
+      CAN_DGN == 1203 | (CAN_DGN >= 1205 & CAN_DGN <= 1207) ~ "Congenital Heart Disease",
+      TRUE ~ "Other"),
+    diagnosis = factor(diagnosis, levels = c("Dilated Cardiomyopathy, Non-Ischemic", "Ischemic Cardiomyopathy", 
+                                             "Restrictive Cardiomyopathy", "Congenital Heart Disease", "Other")),
+    payor = case_when(
+      CAN_PRIMARY_PAY %in% c(2, 3, 4, 5, 6, 7, 13) ~ "Public",
+      CAN_PRIMARY_PAY == 1 ~ "Private",
+      TRUE ~ "Other"),
+    payor = factor(payor, levels = c("Private", "Public", "Other")),
+    lvad_type = case_when(
+      VadBrandId %in% c('236', '330') ~ "HeartMate 3",
+      VadBrandId %in% c('205', '313') ~ "HeartMate II",
+      VadBrandId %in% c('224', '316') ~ "HVAD",
+      TRUE ~ "Other"),
+    lvad_type = factor(lvad_type, levels = c("HeartMate 3", "HeartMate II", "HVAD", "Other"))
+  )
+
+cat("SRTR Table 1 data prepared:", nrow(srtr_table1), "patients\n")
+
+# ============================================================================
+# PREPARE STAR TABLE 1 DATA
+# ============================================================================
+
+star_table1 <- star_lvad_outcomes %>%
+  select(WL_ID_CODE, lvad_implant_date) %>%
+  left_join(
+    thoracic_data_2025q2 %>%
+      select(WL_ID_CODE, GENDER, ETHCAT, INIT_AGE, INIT_WGT_KG_CALC, 
+             INIT_HGT_CM_CALC, ABO, TCR_DGN, PRI_PAYMENT_TCR, INIT_DATE),
+    by = "WL_ID_CODE"
+  ) %>%
+  left_join(
+    thoracic_mcs_device_2025q2 %>%
+      filter(DEVICE_TYPE == "Dischargeable VAD" | 
+               (DEVICE_TYPE == "LVAD" & grepl(paste(lvad_keywords, collapse = "|"), 
+                                              LVAD_BRAND, ignore.case = TRUE))) %>%
+      filter(VENTRICULAR_SUPPORT != "Single" & VENTRICULAR_SUPPORT != "Right") %>%
+      group_by(WL_ID_CODE) %>%
+      arrange(IMPLANT_DATE) %>%
+      slice(1) %>%
+      ungroup() %>%
+      select(WL_ID_CODE, LVAD_BRAND, VAD_BRAND, DEVICE_TYPE),
+    by = "WL_ID_CODE"
+  ) %>%
+  mutate(
+    data_source = "STAR",
+    age_at_listing = floor(INIT_AGE),
+    age_at_lvad = INIT_AGE + as.numeric(difftime(lvad_implant_date, INIT_DATE, units = "days")) / 365.25,
+    age_at_lvad = floor(age_at_lvad),
+    sex = ifelse(GENDER == "M", "Male", "Female"),
+    sex = factor(sex, levels = c("Male", "Female")),
+    race = case_when(
+      ETHCAT == 1 ~ "White",
+      ETHCAT == 2 ~ "Black",
+      ETHCAT == 4 ~ "Hispanic/Latino",
+      ETHCAT == 5 ~ "Asian",
+      TRUE ~ "Other"),
+    race = factor(race, levels = c("White", "Black", "Hispanic/Latino", "Asian", "Other")),
+    bmi = INIT_WGT_KG_CALC / ((INIT_HGT_CM_CALC / 100) * (INIT_HGT_CM_CALC / 100)),
+    bmi_categories = case_when(
+      bmi < 18 ~ "Underweight",
+      bmi >= 18 & bmi < 25 ~ "Normal",
+      bmi >= 25 & bmi < 30 ~ "Overweight",
+      bmi >= 30 ~ "Obese",
+      TRUE ~ "Unknown"),
+    bmi_categories = factor(bmi_categories, levels = c("Normal", "Underweight", "Overweight", "Obese", "Unknown")),
+    blood_type = factor(
+      case_when(
+        ABO %in% c("A", "A1", "A2") ~ "A",
+        ABO %in% c("A1B", "A2B") ~ "AB",
+        TRUE ~ ABO)),
+    diagnosis = case_when(
+      TCR_DGN > 999 & TCR_DGN < 1007 ~ "Dilated Cardiomyopathy, Non-Ischemic",
+      TCR_DGN == 1007 | TCR_DGN == 1200 ~ "Ischemic Cardiomyopathy",
+      TCR_DGN > 1048 & TCR_DGN < 1100 ~ "Restrictive Cardiomyopathy",
+      TCR_DGN == 1203 | (TCR_DGN >= 1205 & TCR_DGN <= 1207) ~ "Congenital Heart Disease",
+      TRUE ~ "Other"),
+    diagnosis = factor(diagnosis, levels = c("Dilated Cardiomyopathy, Non-Ischemic", "Ischemic Cardiomyopathy", 
+                                             "Restrictive Cardiomyopathy", "Congenital Heart Disease", "Other")),
+    payor = case_when(
+      PRI_PAYMENT_TCR == 1 ~ "Private",
+      PRI_PAYMENT_TCR %in% c(2, 3, 4, 5, 6, 7, 13) ~ "Public",
+      TRUE ~ "Other"),
+    payor = factor(payor, levels = c("Private", "Public", "Other")),
+    device_brand = if_else(DEVICE_TYPE == "Dischargeable VAD", VAD_BRAND, LVAD_BRAND),
+    lvad_type = case_when(
+      grepl("HeartMate 3|HM3|HM 3|HeartMate III", device_brand, ignore.case = TRUE) ~ "HeartMate 3",
+      grepl("HeartMate II|HMII|HM II|HM2|HM 2", device_brand, ignore.case = TRUE) ~ "HeartMate II",
+      grepl("HVAD|HeartWare", device_brand, ignore.case = TRUE) ~ "HVAD",
+      TRUE ~ "Other"),
+    lvad_type = factor(lvad_type, levels = c("HeartMate 3", "HeartMate II", "HVAD", "Other"))
+  )
+
+cat("STAR Table 1 data prepared:", nrow(star_table1), "patients\n")
+
+# ============================================================================
+# COMBINE AND CREATE TABLE 1
+# ============================================================================
+
+combined_table1 <- bind_rows(
+  srtr_table1 %>% select(data_source, age_at_listing, age_at_lvad, sex, race, bmi_categories, 
+                         blood_type, diagnosis, payor, lvad_type),
+  star_table1 %>% select(data_source, age_at_listing, age_at_lvad, sex, race, bmi_categories, 
+                         blood_type, diagnosis, payor, lvad_type)
+) %>%
+  mutate(data_source = factor(data_source, levels = c("SRTR", "STAR")))
+
+# Set variable labels
+var_label_list <- list(
+  age_at_listing = "Age at Listing (Years)",
+  age_at_lvad = "Age at LVAD Implant (Years)",
+  sex = "Sex",
+  race = "Race/Ethnicity",
+  bmi_categories = "BMI Category",
+  blood_type = "Blood Type",
+  diagnosis = "Primary Diagnosis",
+  payor = "Insurance Type",
+  lvad_type = "LVAD Device Type"
+)
+
+labelled::var_label(combined_table1) <- var_label_list
+
+# Create table
+table1 <- combined_table1 %>%
+  tbl_summary(
+    by = data_source,
+    digits = list(all_categorical() ~ c(0, 1)),
+    missing = "no"
+  ) %>%
+  add_p(test.args = all_tests("chisq.test") ~ list(workspace = 2e7)) %>%
+  add_overall() %>%
+  modify_header(label ~ "**Characteristic**") %>%
+  modify_caption("**Table 1. Baseline Characteristics of LVAD Cohorts by Data Source**") %>%
+  bold_labels()
+
+table1
+
+```
+
+
+``` {r status4}
+
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+
+# Define dates to check
+dates_to_check <- c(
+  mdy("10-18-2018"),
+  seq(mdy("01-01-2019"), mdy("07-01-2025"), by = "2 months") - days(1)
+)
+
+# Prepare LVAD status 4 justification data
+lvadstatus4 <- just_form_hr_stat4 %>% 
+  select(PX_ID, CriteriaLvadSupport, FormEffectiveDt, FormExpirationDt, RequestedCandStatCd) %>% 
+  filter(CriteriaLvadSupport == 1)
+
+# Function to get status 4 LVAD counts at each date
+get_srtr_status4_lvad <- function(check_date) {
+  
+  cat("Processing SRTR date:", format(check_date, "%Y-%m-%d"), "\n")
+  
+  # Get all candidates actively listed on this date
+  candidates_on_date <- cand_thor2025q2 %>%
+    filter(CAN_LISTING_DT <= check_date) %>%
+    filter(is.na(CAN_REM_DT) | CAN_REM_DT > check_date) %>%
+    filter(CAN_AGE_IN_MONTHS_AT_LISTING / 12 > 17) %>%
+    select(PX_ID, CAN_LISTING_DT, CAN_REM_DT)
+  
+  # Merge with status history to get current status
+  candidates_with_status <- candidates_on_date %>%
+    left_join(stathist_thor2025q2, by = "PX_ID") %>%
+    # Filter to status periods active on check_date
+    filter(CANHX_BEGIN_DT <= check_date) %>%
+    filter(is.na(CANHX_END_DT) | CANHX_END_DT > check_date) %>%
+    # Get most recent status for each candidate
+    group_by(PX_ID) %>%
+    arrange(desc(CANHX_BEGIN_DT)) %>%
+    slice(1) %>%
+    ungroup()
+  
+  # Filter to status 4 candidates (status code 2140)
+  status4_candidates <- candidates_with_status %>%
+    filter(CANHX_STAT_CD == 2140)
+  
+  # Merge with LVAD justification forms to identify LVAD-supported status 4
+  status4_with_lvad_justification <- status4_candidates %>%
+    left_join(
+      lvadstatus4,
+      by = c("PX_ID", "CANHX_BEGIN_DT" = "FormEffectiveDt", "CANHX_STAT_CD" = "RequestedCandStatCd")
+    ) %>%
+    filter(!is.na(CriteriaLvadSupport))
+  
+  total_status4 <- nrow(status4_candidates)
+  status4_with_lvad <- nrow(status4_with_lvad_justification)
+  
+  return(data.frame(
+    date = check_date,
+    total_status4 = total_status4,
+    status4_with_lvad = status4_with_lvad,
+    proportion = ifelse(total_status4 > 0, status4_with_lvad / total_status4 * 100, 0)
+  ))
+}
+
+# Run the loop
+status4_results_list <- lapply(dates_to_check, get_srtr_status4_lvad)
+status4_results_df <- bind_rows(status4_results_list)
+
+# Add formatted labels
+status4_results_df <- status4_results_df %>%
+  mutate(
+    date_label = format(date, "%b %Y")
+  )
+
+# Print results
+cat("\n=== STATUS 4 CANDIDATES WITH LVAD SUPPORT (SRTR) ===\n\n")
+print(status4_results_df)
+
+# ============================================================================
+# PLOT 1: Line plot of absolute numbers
+# ============================================================================
+
+# Reshape data for plotting both lines
+status4_long <- status4_results_df %>%
+  select(date, date_label, total_status4, status4_with_lvad) %>%
+  tidyr::pivot_longer(
+    cols = c(total_status4, status4_with_lvad),
+    names_to = "category",
+    values_to = "count"
+  ) %>%
+  mutate(
+    category = factor(category, 
+                      levels = c("total_status4", "status4_with_lvad"),
+                      labels = c("Total Status 4", "Status 4 with LVAD Support"))
+  )
+
+line_plot <- ggplot(status4_long, aes(x = date, y = count, color = category, linetype = category)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2.5) +
+  scale_color_manual(values = c("Total Status 4" = "#0072B2", 
+                                "Status 4 with LVAD Support" = "#D55E00"),
+                     name = "") +
+  scale_linetype_manual(values = c("Total Status 4" = "solid", 
+                                   "Status 4 with LVAD Support" = "dashed"),
+                        name = "") +
+  labs(
+    title = "Status 4 Candidates with LVAD Support Over Time (SRTR)",
+    x = "Date",
+    y = "Number of Candidates",
+    caption = "Status 4 = Lowest priority for stable candidates"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(face = "bold", size = 14),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) +
+  scale_y_continuous(labels = scales::comma)
+
+print(line_plot)
+
+# ============================================================================
+# PLOT 2: Column plot (stacked bar chart)
+# ============================================================================
+
+# First add factor version to the dataframe if not already present
+status4_results_df <- status4_results_df %>%
+  mutate(
+    date_label = format(date, "%b %d, %Y"),  # e.g., "Oct 18, 2018", "Jan 01, 2019"
+    date_factor = factor(date_label, levels = date_label)  # Ordered factor for equidistant bars
+  )
+
+col_plot <- ggplot(status4_results_df, aes(x = date_factor)) +
+  geom_col(aes(y = total_status4), fill = "#0072B2", alpha = 0.5) +
+  geom_col(aes(y = status4_with_lvad), fill = "#D55E00") +
+  labs(
+    title = "Status 4 Candidates: Total vs. LVAD-Supported (SRTR)",
+    x = "Date",
+    y = "Number of Candidates",
+    caption = "Orange = LVAD-supported Status 4 | Blue = All Status 4"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 9)  # Reduced size for readability
+  ) +
+  scale_y_continuous(labels = scales::comma)
+
+print(col_plot)
+
+
+# ============================================================================
+# PLOT 3: Proportion over time
+# ============================================================================
+
+prop_plot <- ggplot(status4_results_df, aes(x = date, y = proportion)) +
+  geom_line(color = "#D55E00", linewidth = 1.2) +
+  geom_point(size = 2.5, color = "#D55E00") +
+  labs(
+    title = "Proportion of Status 4 Candidates with LVAD Support (SRTR)",
+    x = "Date",
+    y = "Percentage of Status 4 with LVAD (%)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) +
+  scale_y_continuous(limits = c(0, 100), breaks = seq(0, 100, 10))
+
+print(prop_plot)
+
+
+cat("\n=== PLOTS SAVED ===\n")
+cat("Files: srtr_status4_lvad_line.png, srtr_status4_lvad_column.png, srtr_status4_lvad_proportion.png\n")
+
+
+
+
+
+
+
+
+
+
+
+# Prepare data for legend-friendly plotting
+combined_plot_data_long <- combined_plot_data %>%
+  tidyr::pivot_longer(
+    cols = c(total_status4, status4_with_lvad, total_with_lvad),
+    names_to = "category",
+    values_to = "count"
+  ) %>%
+  mutate(
+    category = factor(category,
+                      levels = c("total_with_lvad", "total_status4", "status4_with_lvad"),
+                      labels = c("All Candidates with Status 4 Justifications",
+                                 "Candidates with Status 4 Justifications for LVAD", 
+                                 "All Candidates with LVAD per MCS File"))
+  )
+
+# Create combined plot with proper legend
+combined_plot <- ggplot(combined_plot_data, aes(x = date_factor)) +
+  # Bars
+  geom_col(aes(y = total_status4, fill = "All Candidates with Status 4 Justifications"), alpha = 0.5) +
+  geom_col(aes(y = status4_with_lvad, fill = "Candidates with Status 4 Justifications for LVAD")) +
+  # Line
+  geom_line(aes(y = total_with_lvad, color = "All Candidates with LVAD per MCS File", group = 1), 
+            linewidth = 1.5) +
+  geom_point(aes(y = total_with_lvad, color = "All Candidates with LVAD per MCS File"), 
+             size = 2.5) +
+  # Manual scales for legend
+  scale_fill_manual(
+    name = "",
+    values = c("All Candidates with Status 4 Justifications" = "#0072B2",
+               "Candidates with Status 4 Justifications for LVAD" = "#D55E00"),
+    breaks = c("All Candidates with Status 4 Justifications", "Candidates with Status 4 Justifications for LVAD")
+  ) +
+  scale_color_manual(
+    name = "",
+    values = c("All Candidates with LVAD per MCS File" = "#CC0000")
+  ) +
+  labs(
+    title = "Status 4 Candidates and Overall LVAD Prevalence (SRTR)",
+    x = "Date",
+    y = "Number of Candidates"
+  ) +
+  theme_classic(base_size = 15) +
+  theme(
+    plot.title = element_text(face = "bold", size = 15),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 15),
+    legend.position = "top",
+    legend.text = element_text(size = 15)
+  ) +
+  scale_y_continuous(labels = scales::comma) +
+  guides(
+    fill = guide_legend(order = 1),
+    color = guide_legend(order = 2)
+  )
+
+print(combined_plot)
+
+
+
+
+_______________________________________
+
+
+
+lvadstatus4star = thoracic_stat4_2025q2 %>% select(WL_ID_CODE, CRITERIALVADSUPPORT, FORMEFFECTIVEDT, UNOS_CAND_STAT_CD) %>% filter(CRITERIALVADSUPPORT == 1) %>%
+  mutate(
+    new_UNOS_CAND_STAT_CD = ifelse(UNOS_CAND_STAT_CD == 2020, 2140, UNOS_CAND_STAT_CD))
+
+star_waitlist_hx = thoracic_wlhistory_data_2025q2 %>% select(WL_ID_CODE, CHG_TY, CHG_DATE, UNOS_CAND_STAT_CD) 
+
+
+# Function to get status 4 LVAD counts at each date for STAR
+get_star_status4_lvad <- function(check_date) {
+  
+  cat("Processing STAR date:", format(check_date, "%Y-%m-%d"), "\n")
+  
+  # Get all candidates actively listed on this date
+  candidates_on_date <- thoracic_data_2025q2 %>%
+    filter(INIT_DATE <= check_date) %>%
+    filter(is.na(END_DATE) | END_DATE > check_date) %>%
+    filter(INIT_AGE > 17) %>%
+    select(WL_ID_CODE, INIT_DATE, END_DATE)
+  
+  # Prepare status history with constructed end dates
+  status_history_with_end <- star_waitlist_hx %>%
+    group_by(WL_ID_CODE) %>%
+    arrange(CHG_DATE) %>%
+    mutate(
+      # End date = next status change date
+      status_end_date = lead(CHG_DATE)
+      # If no next status, status_end_date = NA (still in this status)
+    ) %>%
+    ungroup()
+  
+  # Merge with status history to get current status
+  candidates_with_status <- candidates_on_date %>%
+    left_join(status_history_with_end, by = "WL_ID_CODE") %>%
+    # Filter to status periods active on check_date
+    filter(CHG_DATE <= check_date) %>%
+    filter(is.na(status_end_date) | status_end_date > check_date) %>%
+    # Get most recent status for each candidate
+    group_by(WL_ID_CODE) %>%
+    arrange(desc(CHG_DATE)) %>%
+    slice(1) %>%
+    ungroup()
+  
+  # Filter to status 4 candidates (status code 2140)
+  status4_candidates <- candidates_with_status %>%
+    filter(UNOS_CAND_STAT_CD == 2140)
+  
+  # Merge with LVAD justification forms to identify LVAD-supported status 4
+  status4_with_lvad_justification <- status4_candidates %>%
+    left_join(
+      lvadstatus4star,
+      by = c("WL_ID_CODE", "CHG_DATE" = "FORMEFFECTIVEDT", "UNOS_CAND_STAT_CD" = "new_UNOS_CAND_STAT_CD")
+    ) %>%
+    filter(!is.na(CRITERIALVADSUPPORT))
+  
+  total_status4 <- nrow(status4_candidates)
+  status4_with_lvad <- nrow(status4_with_lvad_justification)
+  
+  return(data.frame(
+    date = check_date,
+    total_status4 = total_status4,
+    status4_with_lvad = status4_with_lvad,
+    proportion = ifelse(total_status4 > 0, status4_with_lvad / total_status4 * 100, 0)
+  ))
+}
+
+# Run the loop
+star_status4_results_list <- lapply(dates_to_check, get_star_status4_lvad)
+star_status4_results_df <- bind_rows(star_status4_results_list)
+
+# Add formatted labels
+star_status4_results_df <- star_status4_results_df %>%
+  mutate(
+    date_label = format(date, "%b %d, %Y"),
+    date_factor = factor(date_label, levels = date_label)
+  )
+
+# Print results
+cat("\n=== STATUS 4 CANDIDATES WITH LVAD SUPPORT (STAR) ===\n\n")
+print(star_status4_results_df)
+
+# ============================================================================
+# COMBINE WITH STAR PREVALENCE DATA AND CREATE PLOT
+# ============================================================================
+
+# Combine status 4 data with overall LVAD prevalence data
+star_combined_plot_data <- star_status4_results_df %>%
+  left_join(
+    star_prevalence_df %>% select(date, total_with_lvad),
+    by = "date"
+  ) %>%
+  mutate(
+    date_label = format(date, "%b %d, %Y"),
+    date_factor = factor(date_label, levels = date_label)
+  )
+
+# STAR plot with updated legend labels
+star_combined_plot <- ggplot(star_combined_plot_data, aes(x = date_factor)) +
+  # Bars
+  geom_col(aes(y = total_status4, fill = "All Candidates with Status 4 Justifications"), alpha = 0.5) +
+  geom_col(aes(y = status4_with_lvad, fill = "Candidates with Status 4 Justifications for LVAD")) +
+  # Line
+  geom_line(aes(y = total_with_lvad, color = "All Candidates with LVAD per MCS File", group = 1), 
+            linewidth = 1.5) +
+  geom_point(aes(y = total_with_lvad, color = "All Candidates with LVAD per MCS File"), 
+             size = 2.5) +
+  # Manual scales for legend
+  scale_fill_manual(
+    name = "",
+    values = c("All Candidates with Status 4 Justifications" = "#0072B2",
+               "Candidates with Status 4 Justifications for LVAD" = "#D55E00"),
+    breaks = c("All Candidates with Status 4 Justifications", "Candidates with Status 4 Justifications for LVAD")
+  ) +
+  scale_color_manual(
+    name = "",
+    values = c("All Candidates with LVAD per MCS File" = "#CC0000")
+  ) +
+  labs(
+    title = "Status 4 Candidates and Overall LVAD Prevalence (OPTN STAR)",
+    x = "Date",
+    y = "Number of Candidates"
+  ) +
+  theme_classic(base_size = 15) +
+  theme(
+    plot.title = element_text(face = "bold", size = 15),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 15),
+    legend.position = "top",
+    legend.text = element_text(size = 15)
+  ) +
+  scale_y_continuous(labels = scales::comma) +
+  guides(
+    fill = guide_legend(order = 1),
+    color = guide_legend(order = 2)
+  )
+
+print(star_combined_plot)
+
+
+# ============================================================================
+# OPTIONAL: CREATE SIDE-BY-SIDE COMPARISON (SRTR vs STAR)
+# ============================================================================
+
+# Add data source labels
+srtr_for_comparison <- combined_plot_data %>%
+  mutate(data_source = "SRTR")
+
+star_for_comparison <- star_combined_plot_data %>%
+  mutate(data_source = "OPTN STAR")
+
+# Combine both datasets
+both_sources <- bind_rows(srtr_for_comparison, star_for_comparison)
+
+# Comparison plot with updated legend labels
+comparison_plot <- ggplot(both_sources, aes(x = date_factor)) +
+  geom_col(aes(y = total_status4, fill = "All Candidates with Status 4 Justifications"), alpha = 0.5) +
+  geom_col(aes(y = status4_with_lvad, fill = "Candidates with Status 4 Justifications for LVAD")) +
+  geom_line(aes(y = total_with_lvad, color = "All Candidates with LVAD per MCS File", group = 1), 
+            linewidth = 1.2) +
+  geom_point(aes(y = total_with_lvad, color = "All Candidates with LVAD per MCS File"), 
+             size = 2) +
+  scale_fill_manual(
+    name = "",
+    values = c("All Candidates with Status 4 Justifications" = "steelblue",
+               "Candidates with Status 4 Justifications for LVAD" = "coral"),
+    breaks = c("All Candidates with Status 4 Justifications", "Candidates with Status 4 Justifications for LVAD")
+  ) +
+  scale_color_manual(
+    name = "",
+    values = c("All Candidates with LVAD per MCS File" = "#b24745")
+  ) +
+  facet_wrap(~data_source, ncol = 1, scales = "free_y") +
+  labs(
+    x = "Date",
+    y = "Number of Candidates"
+  ) +
+  theme_classic(base_size = 15) +
+  theme(
+    plot.title = element_text(face = "bold", size = 15),
+    plot.subtitle = element_text(size = 15, color = "gray30"),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 15),
+    axis.text.y = element_text(size = 15),
+    legend.position = "top",
+    legend.text = element_text(size = 15),
+    legend.title = element_text(size = 15, face = "bold"),
+    strip.text = element_text(face = "bold", size = 15)
+  ) +
+  scale_y_continuous(labels = scales::comma) +
+  guides(
+    fill = guide_legend(order = 1),
+    color = guide_legend(order = 2)
+  )
+
+print(comparison_plot)
+
+
+```
+
+
+``` {r supplemental tables}
+
+library(dplyr)
+library(knitr)
+library(kableExtra)
+
+# ============================================================================
+# SRTR STATUS 4 AND PREVALENCE TABLE
+# ============================================================================
+
+srtr_status_prevalence_table <- combined_plot_data %>%
+  select(
+    date,
+    date_label,
+    total_status4,
+    status4_with_lvad,
+    total_with_lvad
+  ) %>%
+  mutate(
+    Date = date_label,
+    `Total Status 4` = total_status4,
+    `Status 4 with LVAD` = status4_with_lvad,
+    `Total LVAD Prevalence` = total_with_lvad
+  ) %>%
+  select(Date, `Total Status 4`, `Status 4 with LVAD`, `Total LVAD Prevalence`)
+
+cat("\n=== SRTR STATUS 4 AND PREVALENCE TABLE ===\n\n")
+print(srtr_status_prevalence_table)
+
+
+# Create formatted HTML table
+srtr_status_html <- kable(srtr_status_prevalence_table, format = "html", 
+                          caption = "Table: SRTR Status 4 Composition and LVAD Prevalence") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), 
+                full_width = FALSE, font_size = 11) %>%
+  add_header_above(c(" " = 1, "Status 4 Composition" = 2, "Prevalence" = 1))
+
+
+
+# ============================================================================
+# STAR STATUS 4 AND PREVALENCE TABLE
+# ============================================================================
+
+star_status_prevalence_table <- star_combined_plot_data %>%
+  select(
+    date,
+    date_label,
+    total_status4,
+    status4_with_lvad,
+    total_with_lvad
+  ) %>%
+  mutate(
+    Date = date_label,
+    `Total Status 4` = total_status4,
+    `Status 4 with LVAD` = status4_with_lvad,
+    `Total LVAD Prevalence` = total_with_lvad
+  ) %>%
+  select(Date, `Total Status 4`, `Status 4 with LVAD`, `Total LVAD Prevalence`)
+
+cat("\n=== STAR STATUS 4 AND PREVALENCE TABLE ===\n\n")
+print(star_status_prevalence_table)
+
+
+# Create formatted HTML table
+star_status_html <- kable(star_status_prevalence_table, format = "html",
+                          caption = "Table: STAR Status 4 Composition and LVAD Prevalence") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, font_size = 11) %>%
+  add_header_above(c(" " = 1, "Status 4 Composition" = 2, "Prevalence" = 1))
+
+
+
+# ============================================================================
+# SRTR FLOW TABLE
+# ============================================================================
+
+srtr_flow_table <- flow_results_df %>%
+  mutate(
+    Period = period_label,
+    `New Listings with LVAD` = new_listings_with_lvad,
+    `LVAD Implants on Waitlist` = lvad_implants_on_waitlist
+  ) %>%
+  select(Period, `New Listings with LVAD`, `LVAD Implants on Waitlist`)
+
+cat("\n=== SRTR FLOW TABLE ===\n\n")
+print(srtr_flow_table)
+
+
+# Create formatted HTML table
+srtr_flow_html <- kable(srtr_flow_table, format = "html",
+                        caption = "Table: SRTR Waitlist Flow Dynamics") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, font_size = 11)
+
+
+
+# ============================================================================
+# STAR FLOW TABLE
+# ============================================================================
+
+star_flow_table <- star_flow_df %>%
+  mutate(
+    Period = period_label,
+    `New Listings with LVAD` = new_listings_with_lvad,
+    `LVAD Implants on Waitlist` = lvad_implants_on_waitlist
+  ) %>%
+  select(Period, `New Listings with LVAD`, `LVAD Implants on Waitlist`)
+
+cat("\n=== STAR FLOW TABLE ===\n\n")
+print(star_flow_table)
+
+
+# Create formatted HTML table
+star_flow_html <- kable(star_flow_table, format = "html",
+                        caption = "Table: STAR Waitlist Flow Dynamics") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, font_size = 11)
+
+
+
+
+srtr_prevalence_html <- prevalence_results_df %>%
+  select(date_label, total_waitlist, total_with_lvad, lvad_proportion) %>%
+  mutate(lvad_proportion = round(lvad_proportion, 2)) %>%
+  kable(format = "html",
+        col.names = c("Date", "Total Waitlist", "Total with LVAD", "LVAD %"),
+        align = c('l', 'r', 'r', 'r'),
+        caption = "Table: SRTR LVAD Prevalence") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, font_size = 11)
+
+
+
+
+star_prevalence_html <- star_prevalence_df %>%
+  select(date_label, total_waitlist, total_with_lvad, lvad_proportion) %>%
+  mutate(lvad_proportion = round(lvad_proportion, 2)) %>%
+  kable(format = "html",
+        col.names = c("Date", "Total Waitlist", "Total with LVAD", "LVAD %"),
+        align = c('l', 'r', 'r', 'r'),
+        caption = "Table: STAR LVAD Prevalence") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, font_size = 11)
+
+
+
+
+
+
+
+srtr_combined_table <- combined_plot_data %>%
+  select(date, date_label, total_status4, status4_with_lvad, total_with_lvad) %>%
+  left_join(
+    prevalence_results_df %>%
+      select(date, total_waitlist, lvad_proportion) %>%
+      mutate(lvad_proportion = round(lvad_proportion, 2)),
+    by = "date"
+  ) %>%
+  select(
+    Date = date_label,
+    `Total Waitlist` = total_waitlist,
+    `Total Status 4` = total_status4,
+    `Status 4 with LVAD` = status4_with_lvad,
+    `Total LVAD Prevalence` = total_with_lvad,
+    `LVAD %` = lvad_proportion
+  )
+
+srtr_combined_html <- kable(srtr_combined_table, format = "html",
+                            caption = "Table: SRTR Status 4 Composition and LVAD Prevalence") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, font_size = 11) %>%
+  add_header_above(c(" " = 1, " " = 1, "Status 4 Composition" = 2, "LVAD Prevalence" = 2))
+
+
+
+
+
+
+
+
+star_combined_table <- star_combined_plot_data %>%
+  select(date, date_label, total_status4, status4_with_lvad, total_with_lvad) %>%
+  left_join(
+    star_prevalence_df %>%
+      select(date, total_waitlist, lvad_proportion) %>%
+      mutate(lvad_proportion = round(lvad_proportion, 2)),
+    by = "date"
+  ) %>%
+  select(
+    Date = date_label,
+    `Total Waitlist` = total_waitlist,
+    `Total Status 4` = total_status4,
+    `Status 4 with LVAD` = status4_with_lvad,
+    `Total LVAD Prevalence` = total_with_lvad,
+    `LVAD %` = lvad_proportion
+  )
+
+star_combined_html <- kable(star_combined_table, format = "html",
+                            caption = "Table: STAR Status 4 Composition and LVAD Prevalence") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, font_size = 11) %>%
+  add_header_above(c(" " = 1, " " = 1, "Status 4 Composition" = 2, "LVAD Prevalence" = 2))
+
+
+```
